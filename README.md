@@ -105,6 +105,6 @@ scipy
 
 ---
 
-## Author
+## Author: Emanuele Pozzani
 
 Built as part of a personal research project on quantitative European equity strategies.
