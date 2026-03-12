@@ -3,7 +3,7 @@
 
 A walk-forward stock screener and portfolio backtesting engine built on a STOXX Europe 600 representative universe. Screens ~120 large-cap European equities each quarter using seven risk-adjusted metrics, then constructs and compares three portfolio strategies against a passive benchmark — after realistic transaction costs.
 
-📊 **[View full backtest report (PDF)](European_Stocks_Screener.pdf)**
+📊 **[View full backtest report (PDF)](European Stocks screener.pdf)**
 
 ---
 
