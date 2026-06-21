@@ -10,11 +10,37 @@
 #  Screening factors:
 #    CAGR · Volatility · Sharpe · Sortino · Max Drawdown · Calmar · Momentum 12-1
 #
-#  Author : [Your Name]
-#  GitHub : [Your GitHub Link]
+#  Author : Emanuele Pozzani
+#
+#  --------------------------------------------------------------------------
+#  PATCH NOTES (this revision)
+#  --------------------------------------------------------------------------
+#  1. Stepped (year-by-year) risk-free rate replaces the single fixed 3%,
+#     which previously spanned both NIRP (2019-21) and the 2022-23 hiking
+#     cycle — see RF_BY_YEAR in section 0bis.
+#  2. Known delistings (e.g. Wirecard, June 2020) are now explicitly kept in
+#     the dataset and marked down to a terminal value instead of being
+#     silently dropped by the data-quality filter — see section 1bis.
+#     This is a PARTIAL survivorship-bias fix, not a complete one — see the
+#     closing "Methodology Notes & Limitations" PDF page for what is and
+#     isn't controlled for.
+#  3. New closing PDF page: "Methodology Notes & Limitations" — discloses
+#     assumptions and known gaps explicitly, next to the results.
+#  4. STRUCTURAL FIX — look-ahead bias in run_backtest(): the selection made
+#     at each rebalancing date `rd` (using data up to and including `rd`)
+#     was being applied to the quarter that had JUST ENDED at `rd` — i.e.
+#     the exact same window that determined the selection — instead of to
+#     the quarter ahead. That let the backtest retroactively "pick" each
+#     quarter's winners after already knowing the outcome, inflating every
+#     performance metric and artificially smoothing drawdowns. Fixed by
+#     applying the selection forward, from `rd` to the next rebalancing
+#     date, matching the walk-forward principle the rest of the script
+#     already followed for the screening step itself.
+#  --------------------------------------------------------------------------
+#
 # =============================================================================
 
-import os, warnings
+import os, warnings, textwrap
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -48,6 +74,51 @@ CONFIG = {
                             os.path.dirname(os.path.abspath(__file__)),
                             "CWW_Screener_Backtest_v4.pdf"),
 }
+
+# =============================================================================
+#  0bis. STEPPED RISK-FREE RATE  (replaces the single fixed 3% assumption)
+# =============================================================================
+#  The original CONFIG["risk_free_rate"] = 3% was applied as one constant
+#  across 2019-2026 — a period that spans Euro-area NIRP (negative rates,
+#  2019-2021) through the 2022-23 hiking cycle (rates above 4%). A single
+#  fixed number quietly distorts every Sharpe / Sortino calculation
+#  depending on which years dominate the window being scored.
+#
+#  RF_BY_YEAR below gives a rough year-by-year annual proxy for the Euro
+#  short rate (ECB deposit facility / Euribor 3M order of magnitude). It's
+#  intentionally simple — a few decimal places of precision aren't the
+#  point — but it's materially closer to reality than one flat number.
+#  Any year not listed here falls back to CONFIG["risk_free_rate"].
+# =============================================================================
+
+RF_BY_YEAR = {
+    2019: 0.00,
+    2020: -0.005,
+    2021: -0.005,
+    2022: 0.02,
+    2023: 0.035,
+    2024: 0.03,
+    2025: 0.025,
+    2026: 0.025,
+}
+
+
+def rf_for_date(date, fallback: float = CONFIG["risk_free_rate"]) -> float:
+    """Annual risk-free rate for the calendar year of `date` (stepped table),
+    falling back to `fallback` for any year not present in RF_BY_YEAR."""
+    return RF_BY_YEAR.get(pd.Timestamp(date).year, fallback)
+
+
+def daily_rf_series(index: pd.DatetimeIndex,
+                    fallback: float = CONFIG["risk_free_rate"]) -> pd.Series:
+    """
+    Daily risk-free-rate series aligned to `index`, where the underlying
+    annual rate is looked up year-by-year from RF_BY_YEAR instead of being
+    one constant across the whole backtest.
+    """
+    annual = pd.Series(
+        [RF_BY_YEAR.get(d.year, fallback) for d in index], index=index)
+    return (1 + annual) ** (1 / 252) - 1
 
 # =============================================================================
 #  1. UNIVERSE
@@ -86,17 +157,64 @@ TICKERS = [
 ]
 
 # =============================================================================
+#  1bis. KNOWN DELISTINGS  (partial survivorship-bias patch)
+# =============================================================================
+#  yfinance simply stops returning rows for a ticker once it stops trading.
+#  The original quality filter (`dropna(thresh=...)`) then treats a company
+#  that went bankrupt/delisted exactly like a ticker with patchy data —
+#  i.e. it gets dropped from the universe and the backtest never
+#  "experiences" the loss. That's a survivorship-bias-by-omission bug.
+#
+#  Fix (partial): explicitly listed delistings inside the backtest window
+#  are kept in the dataset and their price is forced to a terminal value
+#  from the delisting date onward, instead of disappearing. This does NOT
+#  fully remove survivorship bias — it only fixes names hard-coded here.
+#  A complete fix needs point-in-time index constituent data (see the
+#  closing "Methodology Notes & Limitations" PDF page).
+# =============================================================================
+
+DELISTED = {
+    # ticker : (last_trading_date, terminal_price_eur)
+    # Wirecard AG — accounting fraud uncovered, insolvency filed
+    # 25 June 2020, removed from DAX shortly after. Stock ~worthless.
+    "WDI.DE": ("2020-06-25", 0.0),
+}
+
+
+def apply_delisting_patch(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    For every ticker in DELISTED that is present in `raw`, force its price
+    to the terminal value from the last trading date onward, so it is kept
+    by the data-quality filter instead of being dropped for "missing" data.
+    """
+    for tkr, (last_date, terminal_price) in DELISTED.items():
+        if tkr in raw.columns:
+            cutoff = pd.Timestamp(last_date)
+            raw.loc[raw.index >= cutoff, tkr] = terminal_price
+    return raw
+
+# =============================================================================
 #  2. DATA DOWNLOAD
 # =============================================================================
 
 def download_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
     print(f"\n[1/5] Downloading price data for {len(tickers)} tickers …")
-    raw = yf.download(tickers, start=start, end=end,
+    # make sure known delisted tickers are requested even if they weren't
+    # already part of `tickers`
+    all_tickers = list(dict.fromkeys(tickers + list(DELISTED.keys())))
+
+    raw = yf.download(all_tickers, start=start, end=end,
                       auto_adjust=True, progress=False)["Close"]
+
+    # patch known delistings BEFORE the quality filter, so a bankrupt/
+    # delisted name is kept (and marked down) instead of silently dropped
+    raw = apply_delisting_patch(raw)
+
     threshold = int(len(raw) * CONFIG["min_history_frac"])
     raw = raw.dropna(axis=1, thresh=threshold)
     raw = raw.ffill()
-    print(f"       → {raw.shape[1]} tickers retained after quality filter.")
+    print(f"       → {raw.shape[1]} tickers retained after quality filter "
+          f"({len(DELISTED)} known delisting(s) patched, if present in range).")
     return raw
 
 
@@ -122,13 +240,17 @@ def compute_metrics(prices_slice: pd.DataFrame,
     Compute per-ticker metrics on prices_slice.
     Only tickers with enough history are scored.
     Returns DataFrame sorted by composite Score (descending).
+
+    `rf` is now used only as the FALLBACK annual rate for any calendar year
+    not present in RF_BY_YEAR — the rate actually applied is the stepped,
+    year-by-year table (section 0bis), aligned to each ticker's own history.
     """
     min_days  = CONFIG["min_history_days"]
     mom_win   = CONFIG["momentum_window"]
     mom_skip  = CONFIG["momentum_skip"]
-    daily_rf  = (1 + rf) ** (1 / 252) - 1
 
     rets = prices_slice.pct_change().dropna()
+    daily_rf_full = daily_rf_series(rets.index, fallback=rf)
     records = []
 
     for tkr in rets.columns:
@@ -138,6 +260,8 @@ def compute_metrics(prices_slice: pd.DataFrame,
         if len(r) < min_days:
             continue
 
+        daily_rf = daily_rf_full.reindex(r.index)
+
         n_years   = len(r) / 252
         total_ret = (p.iloc[-1] / p.iloc[0]) - 1
         cagr      = (1 + total_ret) ** (1 / n_years) - 1
@@ -145,7 +269,7 @@ def compute_metrics(prices_slice: pd.DataFrame,
         excess    = r - daily_rf
         sharpe    = excess.mean() / r.std() * np.sqrt(252) if r.std() > 0 else np.nan
 
-        downside    = r[r < daily_rf] - daily_rf
+        downside    = (r - daily_rf)[r < daily_rf]
         sortino_den = np.sqrt((downside ** 2).mean()) * np.sqrt(252)
         sortino     = excess.mean() * np.sqrt(252) / sortino_den if sortino_den > 0 else np.nan
 
@@ -281,12 +405,22 @@ def run_backtest(prices_all: pd.DataFrame,
       4. Apply weights forward until next rebalancing date
 
     Benchmark (buy & hold ETF) is simulated in parallel.
+
+    PATCH: step 4 now genuinely applies forward (rd → next rebalancing
+    date). Previously the code applied the selection made AT rd to the
+    quarter that had just ended (prev_date → rd) — i.e. the very same
+    window that determined the selection — which let the backtest
+    retroactively "pick" each quarter's winners after already knowing the
+    outcome. See PATCH NOTES at the top of the file.
     """
     print("\n[3/5] Running walk-forward backtest …")
     freq    = CONFIG["rebalance_freq"]
     top_n   = CONFIG["top_n_stocks"]
     tc      = CONFIG["transaction_cost"]
-    daily_rf = (1 + rf) ** (1 / 252) - 1
+    # NOTE: risk-free rate is no longer one scalar here — every step below
+    # that needs it looks up the stepped rate for the relevant date
+    # (rf_for_date) or date range (daily_rf_series). `rf` is kept only as
+    # the fallback for years outside RF_BY_YEAR.
 
     rets_all     = prices_all.pct_change().dropna()
     rebal_dates  = rets_all.resample(freq).last().index.tolist()
@@ -301,25 +435,43 @@ def run_backtest(prices_all: pd.DataFrame,
     prev_weights  = {s: None for s in strategies}
     prev_tickers  = {s: []   for s in strategies}
 
-    prev_date = rets_all.index[0]
+    # --------------------------------------------------------------------
+    # LOOK-AHEAD BIAS FIX
+    # --------------------------------------------------------------------
+    # Each rebalancing date `rd` screens using only data up to and including
+    # `rd` — that part was always correct walk-forward (no future PRICE
+    # data used). The bug was in what came next: the selection made AT `rd`
+    # (which already "knows" how the quarter ending at `rd` played out) was
+    # then applied to the returns of THAT SAME quarter (prev_date → rd),
+    # instead of to the quarter that hadn't happened yet. That let the
+    # backtest retroactively "pick the winners" of every quarter after the
+    # fact and credit itself with their return.
+    #
+    # Fix: apply the selection made at `rd` to the FORWARD window, from `rd`
+    # to the *next* rebalancing date. Knowing the next calendar rebalancing
+    # date in advance is not leakage — it's a fixed schedule (quarterly),
+    # not information derived from future prices.
+    # --------------------------------------------------------------------
+    last_data_date = rets_all.index[-1]
 
-    for rd in rebal_dates:
+    for i, rd in enumerate(rebal_dates):
         hist_prices = prices_all.loc[:rd]
         hist_rets   = rets_all.loc[:rd]
 
-        # --- STEP 1: walk-forward screening ---
+        # --- STEP 1: walk-forward screening (uses data up to rd only) ---
         metrics = compute_metrics(hist_prices, rf)
         if metrics.empty or len(metrics) < 5:
-            prev_date = rd
             continue
 
         top_tickers = metrics.head(top_n).index.tolist()
         selection_log.append({"date": rd, "tickers": top_tickers,
                                "metrics": metrics.head(top_n)})
 
-        period_rets = rets_all.loc[prev_date:rd][top_tickers].iloc[1:]
+        # forward window: from rd to the NEXT rebalancing date (or to the
+        # end of the data, for the last rebalancing date in the loop)
+        next_rd = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else last_data_date
+        period_rets = rets_all.loc[rd:next_rd][top_tickers].iloc[1:]
         if period_rets.empty:
-            prev_date = rd
             continue
 
         # --- STEP 2: estimate weights on historical data ---
@@ -330,7 +482,8 @@ def run_backtest(prices_all: pd.DataFrame,
         new_weights_map = {
             "EW"      : ew_weights(len(top_tickers)),
             "MinVar"  : min_variance(cov_ann.values),
-            "MaxSharpe": max_sharpe(mean_ann.values, cov_ann.values, rf),
+            "MaxSharpe": max_sharpe(mean_ann.values, cov_ann.values,
+                                      rf_for_date(rd, fallback=rf)),
         }
 
         # --- STEP 3: deduct transaction costs ---
@@ -355,7 +508,6 @@ def run_backtest(prices_all: pd.DataFrame,
             prev_weights[strat] = new_weights_map[strat]
             prev_tickers[strat] = top_tickers[:]
 
-        prev_date = rd
         cost_ew = tc_log["EW"][-1]["cost_bps"] if tc_log["EW"] else 0
         print(f"       Rebalanced {rd.date()} → top {len(top_tickers)} stocks  "
               f"| TC (EW) = {cost_ew:.1f} bps")
@@ -380,14 +532,18 @@ def run_backtest(prices_all: pd.DataFrame,
 # =============================================================================
 
 def portfolio_metrics(nav: pd.Series, rf: float = CONFIG["risk_free_rate"]) -> dict:
+    """
+    `rf` is the fallback annual rate for years outside RF_BY_YEAR — the
+    Sharpe/Sortino calculation below uses the stepped, year-by-year rate.
+    """
     r = nav.pct_change().dropna()
-    daily_rf  = (1 + rf) ** (1 / 252) - 1
+    daily_rf  = daily_rf_series(r.index, fallback=rf)
     n_years   = len(r) / 252
     cagr      = (nav.iloc[-1] / nav.iloc[0]) ** (1 / n_years) - 1
     vol       = r.std() * np.sqrt(252)
     excess    = r - daily_rf
     sharpe    = excess.mean() / r.std() * np.sqrt(252)
-    downside  = r[r < daily_rf] - daily_rf
+    downside  = (r - daily_rf)[r < daily_rf]
     sortino_d = np.sqrt((downside**2).mean()) * np.sqrt(252)
     sortino   = excess.mean() * np.sqrt(252) / sortino_d if sortino_d > 0 else np.nan
     roll_max  = nav.cummax()
@@ -650,11 +806,11 @@ def fig_rolling_sharpe(nav: pd.DataFrame, rf: float,
                         window: int = 252) -> plt.Figure:
     """Rolling Sharpe for all strategies + benchmark."""
     fig, ax = plt.subplots(figsize=(11.7, 4.5))
-    daily_rf = (1 + rf) ** (1 / 252) - 1
     for col in ["EW", "MinVar", "MaxSharpe", "Benchmark"]:
         lw = 1.5 if col == "Benchmark" else 1.8
         ls = "--" if col == "Benchmark" else "-"
         r  = nav[col].pct_change().dropna()
+        daily_rf = daily_rf_series(r.index, fallback=rf)
         rs = ((r - daily_rf).rolling(window).mean() /
               r.rolling(window).std() * np.sqrt(252))
         ax.plot(rs.index, rs, label=col,
@@ -724,6 +880,88 @@ def fig_screening_heatmap(selection_log: list, top_n: int) -> plt.Figure:
 
 
 # =============================================================================
+#  8bis. METHODOLOGY NOTES & LIMITATIONS  (closing disclosure page)
+# =============================================================================
+
+def fig_methodology_notes() -> plt.Figure:
+    """
+    Closing page: states explicitly what the backtest controls for and what
+    it still does not, plus suggested next steps. A backtest is only as
+    credible as the assumptions it discloses next to the results.
+    """
+    fig, ax = plt.subplots(figsize=(11.7, 8.3))
+    ax.axis("off")
+    ax.text(0.5, 0.97, "Methodology Notes & Limitations",
+            ha="center", va="top", fontsize=18, fontweight="bold",
+            color=DARK, transform=ax.transAxes)
+    ax.text(0.5, 0.925,
+            "Read together with the results above — a backtest is only as "
+            "credible as the assumptions it discloses.",
+            ha="center", va="top", fontsize=10, color="#666666",
+            style="italic", transform=ax.transAxes)
+
+    sections = [
+        ("What this backtest controls for", PALETTE["MaxSharpe"], [
+            "Walk-forward screening: at every rebalancing date, only price "
+            "history available up to that date is used (no look-ahead bias "
+            "in screening or optimisation).",
+            "Transaction costs: 10 bps one-way, applied on every weight "
+            "change (entries, exits, rebalancing drift) at each quarterly "
+            "rebalancing date.",
+            "Stepped risk-free rate: the rate used for Sharpe/Sortino now "
+            "varies by year (roughly 0% in 2019-21, rising through the "
+            "2022-23 hiking cycle) instead of one fixed 3% across the full "
+            "2019-2026 period.",
+            "Known delistings: tickers removed from the index due to "
+            "failure or acquisition during the window (e.g. Wirecard, "
+            "June 2020) are kept and marked down to a terminal value "
+            "rather than silently dropped by the data-quality filter.",
+        ]),
+        ("Known limitations (not yet addressed)", PALETTE["MinVar"], [
+            "Residual survivorship bias: the starting universe (~120 "
+            "tickers) was built from companies that exist today. Index "
+            "removals not explicitly hard-coded here are still excluded; "
+            "a fully point-in-time universe needs historical constituent "
+            "data (e.g. iShares daily holdings files).",
+            "Flat transaction costs: 10 bps is applied to every name; "
+            "less liquid small/mid-cap constituents likely carry higher "
+            "real market impact.",
+            "No capacity constraints: position sizing assumes the full "
+            "notional is tradeable at the closing price, with no slippage "
+            "beyond the flat cost assumption.",
+            "Single regime: 2019-2026 is dominated by a strong post-COVID "
+            "bull market; performance has not been isolated across a full "
+            "bear-market cycle.",
+        ]),
+        ("Suggested next steps", PALETTE["EW"], [
+            "Source point-in-time index constituents to remove residual "
+            "survivorship bias entirely.",
+            "Differentiate transaction cost assumptions by market-cap / "
+            "liquidity bucket.",
+            "Add a regime-conditional performance breakdown (bull / bear / "
+            "sideways sub-periods).",
+        ]),
+    ]
+
+    y = 0.865
+    wrap_width = 100
+    for heading, color, bullets in sections:
+        ax.text(0.05, y, heading, fontsize=12.5, fontweight="bold",
+                color=color, transform=ax.transAxes)
+        y -= 0.045
+        for b in bullets:
+            wrapped = textwrap.fill(b, wrap_width)
+            n_lines = wrapped.count("\n") + 1
+            ax.text(0.085, y, f"•  {wrapped}", fontsize=9.3, color=DARK,
+                    transform=ax.transAxes, va="top", linespacing=1.5)
+            y -= 0.027 * n_lines + 0.018
+        y -= 0.018
+
+    plt.tight_layout()
+    return fig
+
+
+# =============================================================================
 #  9. MAIN
 # =============================================================================
 
@@ -757,6 +995,7 @@ def main():
             fig_metrics_bars(nav, rf),
             fig_rolling_sharpe(nav, rf),
             fig_turnover(sel_log, tc_log),
+            fig_methodology_notes(),
         ]:
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
